@@ -1,0 +1,77 @@
+import json
+from pathlib import Path
+from cryptography.fernet import Fernet
+import string, random
+
+# ==================== Directorios ====================
+METADATA_DIR = Path("metadata")
+PASSWORDS_DIR = Path("passwords")
+ENTRIES_DIR = PASSWORDS_DIR / "entries_files"
+
+METADATA_DIR.mkdir(exist_ok=True)
+PASSWORDS_DIR.mkdir(exist_ok=True)
+ENTRIES_DIR.mkdir(exist_ok=True)
+
+DB_PATH = PASSWORDS_DIR / "passwords.db"
+META_PATH = METADATA_DIR / "metadata.json"
+
+# ==================== Funciones DB ====================
+def generate_k_db():
+    return Fernet.generate_key()
+
+def init_empty_db(k_db: bytes):
+    db = {"entries": []}
+    ciphertext = encrypt_db(k_db, db)
+    write_encrypted_db(ciphertext)
+
+def encrypt_db(k_db: bytes, db: dict) -> bytes:
+    f = Fernet(k_db)
+    data = json.dumps(db, ensure_ascii=False).encode()
+    return f.encrypt(data)
+
+def decrypt_db(k_db: bytes, ciphertext: bytes) -> dict:
+    f = Fernet(k_db)
+    return json.loads(f.decrypt(ciphertext).decode())
+
+def read_encrypted_db() -> bytes:
+    if not DB_PATH.exists():
+        return b""
+    return DB_PATH.read_bytes()
+
+def write_encrypted_db(ciphertext: bytes):
+    DB_PATH.write_bytes(ciphertext)
+
+def read_metadata() -> dict:
+    if not META_PATH.exists():
+        return {}
+    return json.loads(META_PATH.read_text())
+
+def update_metadata(meta: dict):
+    META_PATH.write_text(json.dumps(meta, ensure_ascii=False))
+
+# ==================== Funciones util ====================
+def generar_password(longitud=16):
+    chars = string.ascii_letters + string.digits + string.punctuation
+    return ''.join(random.choice(chars) for _ in range(longitud))
+
+def medir_seguridad(password):
+    score = 0
+    if len(password) >= 8: score += 1
+    if any(c.islower() for c in password): score += 1
+    if any(c.isupper() for c in password): score += 1
+    if any(c.isdigit() for c in password): score += 1
+    if any(c in string.punctuation for c in password): score += 1
+    return score
+
+# ==================== Backup / Restore ====================
+def export_wrapped_key(path="backup_wrapped_key.json"):
+    meta = read_metadata()
+    with open(path, "w") as f:
+        json.dump({"wrapped_key": meta.get("wrapped_key")}, f, indent=2)
+    print(f"Clave exportada a {path}")
+
+def import_wrapped_key(path):
+    with open(path) as f:
+        meta = json.load(f)
+    update_metadata(meta)
+    print(f"Clave importada desde {path}")
