@@ -1,0 +1,20 @@
+
+from typing import Optional
+from pathlib import Path 
+
+
+class PMState:
+    def __init__(self):
+        self.unlocked: bool = False
+        self.k_db: Optional[bytes] = None
+
+    def lock(self):
+        self.unlocked = False
+        self.k_db = None
+
+    def unlock(self, k_db: bytes):
+        self.k_db = k_db
+        self.unlocked = True
+
+# instancia global (simple patrón para el CLI de momento)
+state = PMState()
