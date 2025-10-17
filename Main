@@ -1,0 +1,433 @@
+#!/usr/bin/env python3
+import argparse
+import json
+import getpass
+from pathlib import Path
+from datetime import datetime
+import base64
+import sys
+import traceback
+
+import Storage_functions
+import state
+
+# Crypto helpers for wrapping with public key (local)
+from cryptography import x509
+from cryptography.hazmat.primitives.asymmetric import padding as asym_padding
+from cryptography.hazmat.primitives import hashes
+
+# ------------------ Configuración PKCS#11 / DNIe ------------------
+PKCS11_LIB_PATH = r"C:\Program Files\OpenSC Project\OpenSC\pkcs11\opensc-pkcs11.dll"
+
+# ------------------ Directorios ------------------
+METADATA_DIR = Path("metadata")
+PASSWORDS_DIR = Path("passwords")
+ENTRIES_DIR = PASSWORDS_DIR / "entries_files"
+
+METADATA_DIR.mkdir(exist_ok=True)
+PASSWORDS_DIR.mkdir(exist_ok=True)
+ENTRIES_DIR.mkdir(exist_ok=True)
+
+# ------------------ Helpers PKCS#11 ------------------
+def try_import_pykcs11():
+    try:
+        import PyKCS11
+        return PyKCS11
+    except Exception:
+        return None
+
+def find_private_key_handle(session, PyKCS11):
+    CKA_CLASS = PyKCS11.CKA_CLASS
+    CKO_PRIVATE_KEY = PyKCS11.CKO_PRIVATE_KEY
+    try:
+        privs = session.findObjects([(CKA_CLASS, CKO_PRIVATE_KEY)])
+        if not privs:
+            return None
+        return privs[0]
+    except Exception:
+        return None
+
+def decrypt_wrapped_key_with_pykcs11(wrapped_bytes: bytes, pin: str) -> bytes:
+    """
+    Descifra wrapped_bytes usando la clave privada del token (RSA-OAEP).
+    Requiere PyKCS11 y la DLL PKCS11 cargable en PKCS11_LIB_PATH.
+    """
+    PyKCS11 = try_import_pykcs11()
+    if PyKCS11 is None:
+        raise RuntimeError("PyKCS11 no está instalado. Instálalo con: pip install PyKCS11")
+
+    pkcs11 = PyKCS11.PyKCS11Lib()
+    pkcs11.load(PKCS11_LIB_PATH)
+
+    slots = pkcs11.getSlotList(tokenPresent=True)
+    if not slots:
+        raise RuntimeError("No se detectó ningún token/lector con tarjeta insertada.")
+
+    slot = slots[0]
+    session = pkcs11.openSession(slot)
+    try:
+        # login with PIN to allow private key use
+        session.login(pin)
+    except PyKCS11.PyKCS11Error as e:
+        session.closeSession()
+        raise RuntimeError(f"Login fallo (PIN incorrecto o token inaccesible): {e}")
+
+    try:
+        priv_handle = find_private_key_handle(session, PyKCS11)
+        if priv_handle is None:
+            raise RuntimeError("No se encontró clave privada en la tarjeta (token).")
+
+        # Try decrypt with RSA OAEP via token (CKM_RSA_PKCS_OAEP)
+        mech = PyKCS11.Mechanism(PyKCS11.CKM_RSA_PKCS_OAEP, None)
+        try:
+            decrypted = bytes(session.decrypt(priv_handle, wrapped_bytes, mech))
+            return decrypted
+        except Exception as e:
+            # If decrypt fails, raise explicit error
+            raise RuntimeError(f"Error al usar decrypt con la clave privada del token: {e}")
+    finally:
+        try:
+            session.logout()
+        except Exception:
+            pass
+        session.closeSession()
+
+# ------------------ Helpers para extraer certificado público y wrap local ------------------
+def get_certificate_from_token():
+    """
+    Extrae el certificado (DER bytes) del token usando PyKCS11.
+    Devuelve una lista de certificados (DER bytes). Puede requerir solo session abierta sin login.
+    """
+    PyKCS11 = try_import_pykcs11()
+    if PyKCS11 is None:
+        raise RuntimeError("PyKCS11 no está instalado. Instálalo con: pip install PyKCS11")
+
+    pkcs11 = PyKCS11.PyKCS11Lib()
+    pkcs11.load(PKCS11_LIB_PATH)
+
+    slots = pkcs11.getSlotList(tokenPresent=True)
+    if not slots:
+        raise RuntimeError("No se detectó token/lector con tarjeta insertada para leer certificado.")
+
+    slot = slots[0]
+    session = pkcs11.openSession(slot)
+    try:
+        # Buscar objetos de tipo CKO_CERTIFICATE
+        objs = session.findObjects([(PyKCS11.CKA_CLASS, PyKCS11.CKO_CERTIFICATE)])
+        certs = []
+        for o in objs:
+            try:
+                # Obtener atributo CKA_VALUE (contenido DER del certificado)
+                vals = session.getAttributeValue(o, [PyKCS11.CKA_VALUE])
+                der = bytes(vals[0])
+                certs.append(der)
+            except Exception:
+                continue
+        return certs
+    finally:
+        session.closeSession()
+
+def wrap_k_db_with_token_public_key():
+    """
+    Lee k_db desde metadata (RAW_BASE64), extrae certificado público del token,
+    envuelve k_db con RSA-OAEP usando la clave pública del certificado y actualiza metadata.
+    """
+    meta = Storage_functions.read_metadata()
+    if not meta or meta.get("wrapped_key") is None:
+        raise RuntimeError("No hay wrapped_key en metadata. Ejecuta init primero.")
+
+    wrap_alg = meta.get("wrap_alg", "")
+    if wrap_alg != "RAW_BASE64":
+        raise RuntimeError(f"metadata.wrap_alg = {wrap_alg!r}. Solo se puede 'wrap' si actualmente es RAW_BASE64.")
+
+    # Decodificar k_db existente (RAW_BASE64)
+    try:
+        k_db = base64.b64decode(meta["wrapped_key"])
+    except Exception as e:
+        raise RuntimeError(f"wrapped_key en metadata no es base64 válido: {e}")
+
+    # Extraer certificados desde token
+    certs_der = get_certificate_from_token()
+    if not certs_der:
+        raise RuntimeError("No se encontró ningún certificado en el token para envolver la clave.")
+
+    # Intentar usar el primer certificado válido con clave pública RSA
+    public_key = None
+    last_err = None
+    for der in certs_der:
+        try:
+            cert = x509.load_der_x509_certificate(der)
+            pub = cert.public_key()
+            # Confirm it's an RSA public key
+            # If encrypt fails, we'll try next
+            public_key = pub
+            break
+        except Exception as e:
+            last_err = e
+            continue
+
+    if public_key is None:
+        raise RuntimeError(f"No se pudo obtener clave pública RSA desde certificados en token. Error: {last_err}")
+
+    # Usar la clave pública para cifrar k_db con RSA-OAEP (local, con cryptography)
+    try:
+        wrapped = public_key.encrypt(
+            k_db,
+            asym_padding.OAEP(
+                mgf=asym_padding.MGF1(algorithm=hashes.SHA1()),
+                algorithm=hashes.SHA1(),
+                label=None
+            )
+        )
+    except Exception as e:
+        raise RuntimeError(f"Error al cifrar k_db con la clave pública del token: {e}")
+
+    wrapped_b64 = base64.b64encode(wrapped).decode()
+    Storage_functions.update_metadata({"wrapped_key": wrapped_b64, "wrap_alg": "RSA-OAEP", "kdf": None})
+    return True
+
+# ------------------ Helpers internos ------------------
+def _require_unlocked():
+    if not state.state.unlocked or state.state.k_db is None:
+        raise RuntimeError("La base de datos está bloqueada. Usa 'unlock' primero para desbloquear")
+
+# ======================= Comandos =========================
+def cmd_init(args):
+    print("Ejecutando init...")
+    if Path(Storage_functions.DB_PATH).exists():
+        print("La base de datos ya existe. Elimina passwords/passwords.db si quieres reinicializar.")
+        return
+    k_db = Storage_functions.generate_k_db()
+    Storage_functions.init_empty_db(k_db)
+    wrapped_b64 = base64.b64encode(k_db).decode()
+    Storage_functions.update_metadata({"wrapped_key": wrapped_b64, "wrap_alg": "RAW_BASE64", "kdf": None})
+    print("DB inicializada y metadata.json creada. (wrapped_key guardada en RAW_BASE64 para pruebas)")
+
+def cmd_wrap(args):
+    """
+    Envuelve la k_db RAW_BASE64 con la clave pública del DNIe (RSA-OAEP).
+    Requiere lector y token conectados. No pide PIN (solo utiliza el certificado público).
+    """
+    print("Ejecutando wrap (envolver k_db con clave pública del DNIe)...")
+    try:
+        ok = wrap_k_db_with_token_public_key()
+        if ok:
+            print("k_db envuelta correctamente con RSA-OAEP. metadata.json actualizado (wrap_alg='RSA-OAEP').")
+            print("A partir de ahora, unlock pedirá el PIN del DNIe para descifrar la clave.")
+    except Exception as e:
+        print("Error durante wrap:", e)
+        traceback.print_exc()
+
+def cmd_status(args):
+    print("Ejecutando status...")
+    print("Unlocked:", state.state.unlocked)
+
+def cmd_unlock(args):
+    """
+    Versión estricta: NO acepta RAW_BASE64 para desbloquear.
+    Requiere que metadata.wrap_alg == "RSA-OAEP" y pedirá PIN del DNIe.
+    """
+    print("Ejecutando unlock (modo seguro: exige DNIe con RSA-OAEP)...")
+    try:
+        meta = Storage_functions.read_metadata()
+    except Exception as e:
+        print("Error leyendo metadata:", e)
+        return
+
+    if not meta or meta.get("wrapped_key") is None:
+        print("No hay wrapped_key en metadata. Ejecuta 'python main.py init' primero.")
+        return
+
+    wrap_alg = meta.get("wrap_alg", "").upper()
+    if wrap_alg != "RSA-OAEP":
+        print(f"Actualmente metadata.wrap_alg = {meta.get('wrap_alg')!r}.")
+        print("Para que unlock pida PIN debes envolver la clave con la pública del DNIe (wrap).")
+        print("Ejecuta: python main.py wrap  (con lector y DNIe conectados).")
+        return
+
+    # Si llegamos aquí, wrap_alg == "RSA-OAEP"
+    try:
+        wrapped_bytes = base64.b64decode(meta["wrapped_key"])
+    except Exception as e:
+        print("wrapped_key en metadata no es base64 válido:", e)
+        return
+
+    try:
+        pin = getpass.getpass("Introduce el PIN del DNIe: ")
+    except Exception as e:
+        print("Fallo al pedir PIN:", e)
+        return
+
+    try:
+        k_db = decrypt_wrapped_key_with_pykcs11(wrapped_bytes, pin)
+    except Exception as e:
+        print("Error al obtener k_db desde el DNIe:", e)
+        traceback.print_exc()
+        return
+
+    # Verificar y desbloquear
+    try:
+        ciphertext = Storage_functions.read_encrypted_db()
+        if ciphertext:
+            # esto lanza excepción si la clave es incorrecta
+            Storage_functions.decrypt_db(k_db, ciphertext)
+        state.state.unlock(k_db)
+        print("DB desbloqueada correctamente usando clave obtenida del DNIe.")
+    except Exception as e:
+        print("La clave obtenida del DNIe no descifra la DB (integridad fallida):", e)
+        traceback.print_exc()
+        
+def cmd_lock(args):
+    print("Ejecutando lock...")
+    state.state.lock()
+    print("DB bloqueada en memoria.")
+
+def cmd_add(args):
+    print(f"Ejecutando add: {args.name}")
+    try:
+        _require_unlocked()
+    except Exception as e:
+        print("DB bloqueada:", e)
+        return
+
+    ciphertext = Storage_functions.read_encrypted_db()
+    db = Storage_functions.decrypt_db(state.state.k_db, ciphertext)
+    entry = {
+        "id": len(db["entries"]) + 1,
+        "name": args.name,
+        "username": args.username or "",
+        "password": args.password,
+        "notes": args.notes or "",
+        "created": datetime.utcnow().isoformat()
+    }
+    db["entries"].append(entry)
+    db["entries"].sort(key=lambda x: (x.get("username","").lower(), x.get("name","").lower()))
+    Storage_functions.write_encrypted_db(Storage_functions.encrypt_db(state.state.k_db, db))
+    print(f"Entry '{args.name}' añadida correctamente.")
+
+def cmd_list(args):
+    print("Ejecutando list...")
+    try:
+        _require_unlocked()
+    except Exception as e:
+        print("DB bloqueada:", e)
+        return
+    ciphertext = Storage_functions.read_encrypted_db()
+    db = Storage_functions.decrypt_db(state.state.k_db, ciphertext)
+    print("Listado de entradas:")
+    for e in db["entries"]:
+        print(f"{e['id']}: {e['name']} ({e['username']})")
+
+def cmd_get(args):
+    print(f"Ejecutando get: ID {args.id}")
+    try:
+        _require_unlocked()
+    except Exception as e:
+        print("DB bloqueada:", e)
+        return
+    try:
+        cid = int(args.id)
+    except ValueError:
+        print("ID inválido, debe ser un número.")
+        return
+    ciphertext = Storage_functions.read_encrypted_db()
+    db = Storage_functions.decrypt_db(state.state.k_db, ciphertext)
+    for e in db["entries"]:
+        if e["id"] == cid:
+            print("Entrada encontrada:")
+            print(json.dumps(e, indent=2, ensure_ascii=False))
+            return
+    print("Entrada no encontrada.")
+
+def cmd_edit(args):
+    _require_unlocked()  # Verifica que la DB esté desbloqueada
+    
+    try:
+        cid = int(args.id)
+    except ValueError:
+        print("ID inválido. Debe ser un número.")
+        return
+
+    ciphertext = Storage_functions.read_encrypted_db()
+    db = Storage_functions.decrypt_db(state.state.k_db, ciphertext)
+
+    # Buscar entrada
+    entry = next((e for e in db["entries"] if e["id"] == cid), None)
+    if entry is None:
+        print("Entrada no encontrada.")
+        return
+
+    # Pedir nuevos valores (si vacío, no se modifica)
+    print(f"Editando entrada ID {cid} (dejar vacío para no cambiar):")
+    new_name = input(f"Nombre [{entry['name']}]: ").strip() or entry['name']
+    new_username = input(f"Username [{entry['username']}]: ").strip() or entry['username']
+    new_password = input(f"Password [{entry['password']}]: ").strip() or entry['password']
+    new_notes = input(f"Notas [{entry['notes']}]: ").strip() or entry['notes']
+
+    # Actualizar entrada
+    entry.update({
+        "name": new_name,
+        "username": new_username,
+        "password": new_password,
+        "notes": new_notes
+    })
+
+    # Ordenar entradas y guardar DB cifrada
+    db["entries"].sort(key=lambda x: (x.get("username","").lower(), x.get("name","").lower()))
+    Storage_functions.write_encrypted_db(Storage_functions.encrypt_db(state.state.k_db, db))
+
+    # Actualizar archivo individual
+    filename = Storage_functions.ENTRIES_DIR / f"{entry['id']}_{entry['name'].replace(' ', '_')}.json"
+    with open(filename, "w", encoding="utf-8") as f:
+        json.dump(entry, f, indent=2, ensure_ascii=False)
+
+    print(f"Entrada ID {cid} actualizada correctamente.")
+
+# ======================= Main CLI =========================
+def main():
+    parser = argparse.ArgumentParser(prog="PM", description="Password Manager DNIe")
+    sub = parser.add_subparsers(dest="cmd")
+
+    sub_init = sub.add_parser("init")
+    sub_init.set_defaults(func=cmd_init)
+
+    sub_wrap = sub.add_parser("wrap")
+    sub_wrap.set_defaults(func=cmd_wrap)
+
+    sub_status = sub.add_parser("status")
+    sub_status.set_defaults(func=cmd_status)
+
+    sub_unlock = sub.add_parser("unlock")
+    sub_unlock.set_defaults(func=cmd_unlock)
+
+    sub_lock = sub.add_parser("lock")
+    sub_lock.set_defaults(func=cmd_lock)
+
+    sub_add = sub.add_parser("add")
+    sub_add.add_argument("name")
+    sub_add.add_argument("--username", "-u", default="")
+    sub_add.add_argument("--password", "-p", required=True)
+    sub_add.add_argument("--notes", "-n", default="")
+    sub_add.set_defaults(func=cmd_add)
+
+    sub_list = sub.add_parser("list")
+    sub_list.set_defaults(func=cmd_list)
+
+    sub_get = sub.add_parser("get")
+    sub_get.add_argument("id")
+    sub_get.set_defaults(func=cmd_get)
+
+    sub_edit = sub.add_parser("edit")
+    sub_edit.add_argument("id", help="ID de la entrada a editar")
+    sub_edit.set_defaults(func=cmd_edit)
+
+
+    args = parser.parse_args()
+    print(f"Comando ejecutado: {args.cmd}")
+    if hasattr(args, "func"):
+        args.func(args)
+    else:
+        parser.print_help()
+
+if __name__ == "__main__":
+    main()
