@@ -1,20 +1,77 @@
-
+import json
+import os
+import base64
 from typing import Optional
-from pathlib import Path 
 
+STATE_FILE = os.path.join(os.path.dirname(__file__), "session_state.json")
 
 class PMState:
     def __init__(self):
-        self.unlocked: bool = False
-        self.k_db: Optional[bytes] = None
+        self.unlocked: bool = False      # Estado en memoria
+        self.k_db: Optional[bytes] = None  # Clave en bytes
+        self._load_state_from_disk()       # Cargar estado persistente al iniciar
 
-    def lock(self):
-        self.unlocked = False
-        self.k_db = None
+    # ---------------- Persistencia ----------------
+    def _save_state_to_disk(self):
+        """Guarda la clave (bytes) y el estado desbloqueado en disco."""
+        try:
+            data = {
+                "unlocked": self.unlocked,
+                "k_db": base64.b64encode(self.k_db).decode() if self.k_db else None
+            }
+            with open(STATE_FILE, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+        except Exception as e:
+            print(f"⚠️ Error guardando el estado: {e}")
 
-    def unlock(self, k_db: bytes):
+    def _load_state_from_disk(self):
+        """Carga la clave y el estado desbloqueado desde disco."""
+        if not os.path.exists(STATE_FILE):
+            return
+        try:
+            with open(STATE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            self.unlocked = data.get("unlocked", False)
+            k_db_b64 = data.get("k_db")
+            self.k_db = base64.b64decode(k_db_b64) if k_db_b64 else None
+        except Exception as e:
+            print(f"⚠️ Error cargando el estado: {e}")
+
+    # ---------------- Comandos ----------------
+    def init(self, k_db: bytes):
+        """Inicializa la DB y desbloquea la clave en memoria y disco."""
         self.k_db = k_db
         self.unlocked = True
+        self._save_state_to_disk()
+        print("💾 Clave inicializada y desbloqueada.")
 
-# instancia global (simple patrón para el CLI de momento)
+    def wrap(self):
+        """Bloquea la DB en memoria, pero mantiene la clave guardada en disco."""
+        if self.k_db is None:
+            print("❌ No hay clave en memoria. Ejecuta init o unlock primero.")
+            return False
+        self.unlocked = False
+        self._save_state_to_disk()
+        print("🔒 DB bloqueada en memoria.")
+        return True
+
+    def lock(self):
+        """Bloquea DB y elimina la clave de memoria y disco."""
+        self.k_db = None
+        self.unlocked = False
+        self._save_state_to_disk()
+        print("🧹 DB completamente bloqueada (memoria + disco).")
+
+    def unlock(self, k_db: Optional[bytes] = None):
+        """Desbloquea DB: usa clave pasada o la que está en disco."""
+        if k_db is not None:
+            self.k_db = k_db
+        if self.k_db is None:
+            print("❌ No hay clave para desbloquear.")
+            return
+        self.unlocked = True
+        self._save_state_to_disk()
+        print("🔓 DB desbloqueada y guardada en disco.")
+
+# Instancia global única
 state = PMState()
