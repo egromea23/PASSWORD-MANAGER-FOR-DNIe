@@ -49,29 +49,24 @@ def read_metadata() -> dict:
 def update_metadata(meta: dict):
     META_PATH.write_text(json.dumps(meta, ensure_ascii=False))
 
-# ==================== Funciones util ====================
-def generar_password(longitud=16):
-    chars = string.ascii_letters + string.digits + string.punctuation
-    return ''.join(random.choice(chars) for _ in range(longitud))
+import json
+from pathlib import Path
 
-def medir_seguridad(password):
-    score = 0
-    if len(password) >= 8: score += 1
-    if any(c.islower() for c in password): score += 1
-    if any(c.isupper() for c in password): score += 1
-    if any(c.isdigit() for c in password): score += 1
-    if any(c in string.punctuation for c in password): score += 1
-    return score
+TEMP_DB_PATH = Path("passwords/temp_db.json")
 
-# ==================== Backup / Restore ====================
-def export_wrapped_key(path="backup_wrapped_key.json"):
-    meta = read_metadata()
-    with open(path, "w") as f:
-        json.dump({"wrapped_key": meta.get("wrapped_key")}, f, indent=2)
-    print(f"Clave exportada a {path}")
+def save_json_db(k_db_json):
+    TEMP_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(TEMP_DB_PATH, "w", encoding="utf-8") as f:
+        json.dump(k_db_json, f, indent=2, ensure_ascii=False)
 
-def import_wrapped_key(path):
-    with open(path) as f:
-        meta = json.load(f)
-    update_metadata(meta)
-    print(f"Clave importada desde {path}")
+def load_json_db():
+    if not TEMP_DB_PATH.exists():
+        return []
+    with open(TEMP_DB_PATH, "r", encoding="utf-8") as f:
+        return json.load(f)
+    
+def get_next_id(db_json):
+    """Devuelve el siguiente ID disponible (1, 2, 3, …)."""
+    if not db_json:
+        return 1
+    return max(entry["id"] for entry in db_json) + 1
