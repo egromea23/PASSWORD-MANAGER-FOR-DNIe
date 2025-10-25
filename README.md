@@ -32,7 +32,7 @@ PasswordManager_DNIe/
 │
 ├── metadata/
 │   └── metadata.json      → Contiene la clave envuelta
-│
+│── session_state.json → Contiene el estado de las variables compartidas
 └── passwords/
     ├── passwords.db       → Base de datos cifrada
     └── entries_files/     → Archivos JSON de cada entrada
@@ -162,6 +162,7 @@ python Main.py list
 python Main.py get 1
 python Main.py edit 1
 python Main.py lock
+python Main.py status
 
 
 🧠 SEGURIDAD IMPLEMENTADA
